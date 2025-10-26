@@ -1,0 +1,125 @@
+﻿@using Microsoft.Agents.AI.Workflows
+@using Microsoft.Extensions.AI
+@using Microsoft.FluentUI.AspNetCore.Components
+@using OpenAI
+@using System.ClientModel
+@using System.Text.Json
+
+<FluentStack Orientation="Orientation.Vertical" Style="height: calc(100% - 200px)">
+	<FluentStack Orientation="Orientation.Vertical" Style="flex-grow: 1; overflow-y: scroll">
+		@foreach (var message in _messages)
+		{
+			var backgroundColor = message.Role == ChatRole.User ? "#fff2df" : "#dafaff";
+			<FluentStack VerticalGap="0" Orientation="Orientation.Vertical" Style=@($"border-radius: 10px; background-color: {backgroundColor}; padding: 8px;")>
+				@foreach (var content in message.Contents)
+				{
+					switch (content)
+					{
+						case TextContent textContent:
+							<FluentLabel Weight="FontWeight.Bold">@($"{message.AuthorName ?? message.Role.ToString()}")</FluentLabel>
+							<FluentLabel>@textContent.Text</FluentLabel>
+							break;
+						case FunctionCallContent functionCallContent:
+							<FluentLabel Weight="FontWeight.Bold">@($"{message.AuthorName ?? message.Role.ToString()}")</FluentLabel>
+							<FluentLabel>@($"Calling {functionCallContent.Name} with arguments {JsonSerializer.Serialize(functionCallContent.Arguments, new JsonSerializerOptions() { WriteIndented = true })}")</FluentLabel>
+							break;
+@* 						case FunctionResultContent functionResultContent:
+							<FluentLabel Weight="FontWeight.Bold">@($"{message.AuthorName ?? message.Role.ToString()}")</FluentLabel>
+							<FluentLabel>@functionResultContent.Result</FluentLabel>
+							break; *@
+					}
+				}
+			</FluentStack>
+		}
+	</FluentStack>
+	<FluentStack Orientation="Orientation.Horizontal">
+		<FluentTextField @bind-Value="_userInputMessage" @onkeyup="OnKeyUp" Placeholder="Type your message..." Style="flex-grow: 1" />
+		<FluentButton Appearance="Appearance.Accent" OnClick="OnClick">Send</FluentButton>
+	</FluentStack>
+</FluentStack>
+
+@code {
+	private string _userInputMessage = string.Empty;
+	private List<ChatMessage> _messages = new();
+
+	private async Task OnKeyUp(KeyboardEventArgs e)
+	{
+		if (e.Key == "Enter") await OnClick();
+	}
+
+	private async Task OnClick()
+	{
+		if (string.IsNullOrWhiteSpace(_userInputMessage)) return;
+		_messages.Add(new ChatMessage()
+		{
+			MessageId = Guid.NewGuid().ToString(),
+			Role = ChatRole.User,
+			Contents = [new TextContent(_userInputMessage)]
+		});
+		_userInputMessage = string.Empty;
+		await InvokeChatCompletionLocal(_messages);
+		StateHasChanged();
+		// Console.WriteLine(JsonSerializer.Serialize(_messages, new JsonSerializerOptions() { WriteIndented = true  }));
+	}
+
+	private async Task InvokeChatCompletionLocal(List<ChatMessage> messages)
+	{
+		var localEndpoint = new Uri("http://localhost:8080");
+		var localModelId = "ggml-org/qwen2.5-VL-7B-Instruct-GGUF";
+
+		var openAIClient = new OpenAIClient(
+			new ApiKeyCredential("NO_API_KEY"),
+			new OpenAIClientOptions
+			{
+				Endpoint = localEndpoint
+			});
+
+		var chatClient = openAIClient.GetChatClient(localModelId).AsIChatClient();
+
+		var movieExpertAgent = chatClient.CreateAIAgent(
+			instructions: "You are expert in movies. Do not answer if not about movies.",
+			name: "movie_expert_agent");
+
+		var mathExpertAgent = chatClient.CreateAIAgent(
+			instructions: "You are expert in math. Do not answer if not about math.",
+			name: "math_expert_agent");
+
+		var triageAgent = chatClient.CreateAIAgent(
+			instructions: "You are an agent routes messages to the appropriate specialist agent listed in your functions/tools.",
+			name: "triage_agent");
+
+		var workflow = AgentWorkflowBuilder
+			.CreateHandoffBuilderWith(triageAgent)
+			.WithHandoffs(triageAgent, [mathExpertAgent, movieExpertAgent])
+			.Build();
+
+		var run = await InProcessExecution.StreamAsync(workflow, messages);
+		await run.TrySendMessageAsync(new TurnToken(emitEvents: true));
+		await foreach (WorkflowEvent wfEvent in run.WatchStreamAsync().ConfigureAwait(false))
+		{
+			switch (wfEvent)
+			{
+				case AgentRunUpdateEvent e:
+					var lastChatMessage = messages.LastOrDefault();
+					if (lastChatMessage is null || lastChatMessage.MessageId != e.Update.MessageId)
+					{
+						lastChatMessage = new ChatMessage()
+							{
+								MessageId = e.Update.MessageId,
+								Role = (ChatRole)e.Update.Role!,
+								AuthorName = e.Update.AuthorName
+							};
+						_messages.Add(lastChatMessage);
+					}
+					lastChatMessage.Contents = [new TextContent(e.Update.Text)];
+					break;
+
+				case WorkflowOutputEvent e:
+					messages.Clear();
+					messages.AddRange((List<ChatMessage>)e.Data!);
+					break;
+			}
+			StateHasChanged();
+		}
+	}
+}
